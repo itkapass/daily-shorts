@@ -1,0 +1,118 @@
+name: Generate Video Drafts
+
+# ─────────────────────────────────────────────────────────────────
+# Runs once a day. Builds the WHOLE day's batch (every category that
+# has surviving candidates, split into Part 1/2/3 as needed — see
+# engine/topic_assembler.py) for a date 2 days from now (Section 5:
+# "pre-generate at least 2-3 days ahead ... so a generation failure
+# never threatens a near-term slot").
+#
+# Runs at 06:00 UTC — after Gemini's free-tier quota resets at midnight
+# Pacific (07:00/08:00 UTC depending on daylight saving), so this always
+# starts the day with a fresh LLM budget (see engine/daycycle.py).
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Generate for this date instead (YYYY-MM-DD, blank = 2 days from today)"
+        required: false
+        default: ""
+      ahead_days:
+        description: "How many days ahead of today to generate for (ignored if 'date' is set)"
+        required: false
+        default: "2"
+
+permissions:
+  contents: read
+  models: read   # lets the automatic GITHUB_TOKEN call GitHub Models — the
+                 # third, zero-signup free LLM fallback (engine/github_models_provider.py)
+
+jobs:
+  generate:
+    name: Generate Video Drafts
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Cache Kokoro offline voice model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kokoro_tts
+          key: kokoro-tts-model-v1
+
+      - name: Run the generation pipeline
+        env:
+          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL:          ${{ secrets.GEMINI_MODEL }}
+          GEMINI_TEMPERATURE:    ${{ secrets.GEMINI_TEMPERATURE }}
+          GROQ_API_KEY:          ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL:            ${{ secrets.GROQ_MODEL }}
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+          R2_ACCOUNT_ID:         ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID:      ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:  ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE:        ${{ secrets.R2_PUBLIC_BASE }}
+          STORAGE_BUCKET:        ${{ secrets.STORAGE_BUCKET }}
+          VOICE_PROVIDER:        ${{ secrets.VOICE_PROVIDER }}
+          GOOGLE_TTS_API_KEY:    ${{ secrets.GOOGLE_TTS_API_KEY }}
+          AZURE_TTS_KEY:         ${{ secrets.AZURE_TTS_KEY }}
+          AZURE_TTS_REGION:      ${{ secrets.AZURE_TTS_REGION }}
+          XTTS_SPEAKER_WAV_PATH: ${{ secrets.XTTS_SPEAKER_WAV_PATH }}
+          ELEVENLABS_API_KEY:    ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID:   ${{ secrets.ELEVENLABS_VOICE_ID }}
+          HUGGINGFACE_API_KEY:   ${{ secrets.HUGGINGFACE_API_KEY }}
+          HUGGINGFACE_IMAGE_MODEL: ${{ secrets.HUGGINGFACE_IMAGE_MODEL }}
+          YOUTUBE_CHANNEL_HANDLE: ${{ secrets.YOUTUBE_CHANNEL_HANDLE }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST:             ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:             ${{ secrets.SMTP_PORT }}
+          SMTP_USER:             ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:         ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO:        ${{ secrets.ALERT_EMAIL_TO }}
+          TARGET_RUNTIME_SECONDS: ${{ secrets.TARGET_RUNTIME_SECONDS }}
+          OUTPUT_DIR:            /tmp/shorts_output
+          ASSETS_DIR:            assets
+        run: |
+          ARGS=""
+          if [ -n "${{ inputs.date }}" ]; then
+            ARGS="--date ${{ inputs.date }}"
+          elif [ -n "${{ inputs.ahead_days }}" ]; then
+            ARGS="--ahead-days ${{ inputs.ahead_days }}"
+          fi
+          python -m engine.orchestrator $ARGS
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: |
+          python -c "from engine import alerts; alerts.alert('Generate workflow crashed', 'The generate.yml run failed before engine/alerts.py could report a more specific error. Check the Actions log.', severity='critical')"

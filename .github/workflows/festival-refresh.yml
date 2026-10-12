@@ -1,0 +1,46 @@
+name: Refresh Lunar Festival Calendar
+
+# ─────────────────────────────────────────────────────────────────
+# Section 3: "never hardcode a shifting date permanently; build a yearly
+# refresh step into the pipeline (automated, not manual)."
+#
+# Runs monthly rather than strictly once a year — the refresh itself is
+# idempotent (upsert on year+month+day+name) and nearly free (one API
+# call against Calendarific's free tier), so running it more often just
+# means a single missed/failed run doesn't leave the calendar stale for
+# an entire year. It always (re)writes THIS year and NEXT year.
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 3 1 * *'   # 03:00 UTC on the 1st of every month
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    name: Refresh lunar/shifting festival dates
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Refresh festival calendar
+        env:
+          SUPABASE_URL:            ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:    ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CALENDARIFIC_API_KEY:    ${{ secrets.CALENDARIFIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN:      ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:        ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -m engine.observances --refresh

@@ -1,0 +1,71 @@
+name: Publish Approved Videos
+
+# ─────────────────────────────────────────────────────────────────
+# Runs hourly. Only actually uploads a video whose scheduled_at has
+# passed (engine/scheduler.py due_for_publish) — most hourly runs find
+# nothing due and exit in a few seconds. This is what makes Section 5's
+# "11 PM-5 AM window, 20-30 minutes apart" scheduling real: the SLOT
+# times are decided once at generation time, and this workflow just
+# checks the clock often enough not to miss one.
+# ─────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '7 * * * *'   # hourly, off the hour
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish to YouTube
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Publish due videos to YouTube
+        env:
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+          R2_ACCOUNT_ID:         ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID:      ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:  ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_PUBLIC_BASE:        ${{ secrets.R2_PUBLIC_BASE }}
+          STORAGE_BUCKET:        ${{ secrets.STORAGE_BUCKET }}
+          YOUTUBE_CLIENT_ID:     ${{ secrets.YOUTUBE_CLIENT_ID }}
+          YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
+          YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
+          MAX_UPLOADS_PER_DAY:   ${{ secrets.MAX_UPLOADS_PER_DAY }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST:             ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:             ${{ secrets.SMTP_PORT }}
+          SMTP_USER:             ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:         ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO:        ${{ secrets.ALERT_EMAIL_TO }}
+          OUTPUT_DIR:            /tmp/shorts_output
+        run: |
+          python -m engine.publish_queue
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: |
+          python -c "from engine import alerts; alerts.alert('Publish workflow crashed', 'The publish.yml run failed. Check the Actions log.', severity='critical')"
