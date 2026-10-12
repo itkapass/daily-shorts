@@ -117,7 +117,14 @@ def _call_gemini(system_prompt: str, user_prompt: str, temperature: float) -> st
         raise RuntimeError("GEMINI_API_KEY not set.")
     from google import genai
     client = genai.Client(api_key=api_key)
-    model = get("GEMINI_MODEL") or "gemini-2.5-flash"
+    # Google retires Gemini model names over time — "gemini-2.5-flash" was
+    # this project's original default but is already gone for new API keys
+    # as of October 2026 (confirmed via the API's own error message, which
+    # names the current replacement). If this ever 404s again with a
+    # "no longer available" message, that message names the correct
+    # current model — put it in GEMINI_MODEL in .env rather than waiting
+    # for a code update, since this default will drift again.
+    model = get("GEMINI_MODEL") or "gemini-3.8-flash"
     try:
         resp = client.models.generate_content(
             model=model,

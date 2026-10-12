@@ -84,7 +84,7 @@ def check_gemini():
         from google import genai
         client = genai.Client(api_key=get("GEMINI_API_KEY"))
         resp = client.models.generate_content(
-            model=get("GEMINI_MODEL") or "gemini-2.5-flash", contents="Say the word OK."
+            model=get("GEMINI_MODEL") or "gemini-3.8-flash", contents="Say the word OK."
         )
         _ok("Gemini responded", resp.text.strip()[:40])
         return True
