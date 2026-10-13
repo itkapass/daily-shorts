@@ -21,6 +21,8 @@ INDIA FILTER
 "India-specific" category (Section 2, item 3) from genuine Wikidata facts
 rather than guessing from a name.
 """
+import time
+
 import requests
 
 REST_BASE = "https://en.wikipedia.org/api/rest_v1"
@@ -30,6 +32,63 @@ USER_AGENT = "DailyHistoryShorts/1.0 (free educational short-form video project)
 REQUEST_TIMEOUT = 15
 
 INDIA_QID = "Q668"
+
+# ── Pacing + backoff ──────────────────────────────────────────────────────
+# Wikipedia/Wikidata are free and keyless, which makes them the easiest
+# thing in this pipeline to accidentally rate-limit: a single busy day's
+# raw "on this day" list can run into the hundreds of candidates, and
+# firing that many requests back-to-back with no pacing reliably trips a
+# 429 partway through and silently drops every candidate after that point
+# (this is exactly what happened on 2026-10-13's test run — 366 failed
+# lookups in one batch). _get() below paces every call and retries once
+# or twice on a 429 before giving up; topic_assembler.py separately caps
+# how many raw candidates even reach this module (see MAX_CANDIDATES_CONSIDERED
+# there) so the two fixes together bound both the rate AND the volume.
+_MIN_INTERVAL_SECONDS = 0.4
+_last_request_at = [0.0]
+
+
+def _throttle():
+    elapsed = time.monotonic() - _last_request_at[0]
+    if elapsed < _MIN_INTERVAL_SECONDS:
+        time.sleep(_MIN_INTERVAL_SECONDS - elapsed)
+    _last_request_at[0] = time.monotonic()
+
+
+def _get(url: str, params: dict = None, timeout: int = REQUEST_TIMEOUT,
+          max_attempts: int = 3, extra_headers: dict = None):
+    headers = {"User-Agent": USER_AGENT}
+    if extra_headers:
+        headers.update(extra_headers)
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        _throttle()
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if resp.status_code == 429 and attempt < max_attempts:
+                wait = 2 * attempt
+                print(f"[wikidata_source] 429, backing off {wait}s (attempt {attempt}/{max_attempts})...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            if attempt < max_attempts and "429" in str(e):
+                wait = 2 * attempt
+                time.sleep(wait)
+                continue
+            raise
+    raise last_exc
+
+
+# In-process caches — a single run resolves the same person twice (the
+# India-specific category re-filters the same raw births/deaths list), so
+# memoizing here means the second pass costs zero extra network calls.
+_qid_cache = {}
+_citizenship_cache = {}
+_birth_death_cache = {}
+_image_claim_cache = {}
 
 
 def fetch_on_this_day(month: int, day: int) -> dict:
@@ -45,11 +104,7 @@ def fetch_on_this_day(month: int, day: int) -> dict:
     out = {"births": [], "deaths": [], "events": [], "holidays": []}
     for kind in out.keys():
         try:
-            resp = requests.get(
-                f"{REST_BASE}/feed/onthisday/{kind}/{month:02d}/{day:02d}",
-                headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
+            resp = _get(f"{REST_BASE}/feed/onthisday/{kind}/{month:02d}/{day:02d}")
             out[kind] = resp.json().get(kind, [])
         except Exception as e:
             print(f"[wikidata_source] On-this-day '{kind}' fetch failed: {e}")
@@ -64,33 +119,34 @@ def resolve_qid(wikipedia_title: str) -> str:
     """
     if not wikipedia_title:
         return None
+    if wikipedia_title in _qid_cache:
+        return _qid_cache[wikipedia_title]
+    qid = None
     try:
-        resp = requests.get(
+        resp = _get(
             WIKIPEDIA_API,
             params={
                 "action": "query", "prop": "pageprops", "titles": wikipedia_title,
                 "format": "json", "redirects": 1,
             },
-            headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT,
         )
-        resp.raise_for_status()
         pages = resp.json().get("query", {}).get("pages", {})
         for page in pages.values():
-            qid = (page.get("pageprops") or {}).get("wikibase_item")
-            if qid:
-                return qid
+            found = (page.get("pageprops") or {}).get("wikibase_item")
+            if found:
+                qid = found
+                break
     except Exception as e:
         print(f"[wikidata_source] QID lookup failed for '{wikipedia_title}': {e}")
-    return None
+    _qid_cache[wikipedia_title] = qid
+    return qid
 
 
 def _sparql(query: str) -> list:
-    resp = requests.get(
+    resp = _get(
         WIKIDATA_SPARQL, params={"query": query, "format": "json"},
-        headers={"User-Agent": USER_AGENT, "Accept": "application/sparql-results+json"},
-        timeout=REQUEST_TIMEOUT,
+        extra_headers={"Accept": "application/sparql-results+json"},
     )
-    resp.raise_for_status()
     return resp.json().get("results", {}).get("bindings", [])
 
 
@@ -99,6 +155,8 @@ def country_of_citizenship(qid: str) -> list:
     citizenship (Wikidata P27) for `qid`. Empty list on no data or failure."""
     if not qid:
         return []
+    if qid in _citizenship_cache:
+        return _citizenship_cache[qid]
     query = f"""
     SELECT ?country ?countryLabel WHERE {{
       wd:{qid} wdt:P27 ?country .
@@ -107,11 +165,13 @@ def country_of_citizenship(qid: str) -> list:
     """
     try:
         rows = _sparql(query)
-        return [{"qid": r["country"]["value"].rsplit("/", 1)[-1], "label": r["countryLabel"]["value"]}
-                for r in rows]
+        result = [{"qid": r["country"]["value"].rsplit("/", 1)[-1], "label": r["countryLabel"]["value"]}
+                  for r in rows]
     except Exception as e:
         print(f"[wikidata_source] Citizenship lookup failed for {qid}: {e}")
-        return []
+        result = []
+    _citizenship_cache[qid] = result
+    return result
 
 
 def is_indian(qid: str) -> bool:
@@ -125,6 +185,8 @@ def birth_death_years(qid: str) -> dict:
     separate from the free-text 'On this day' blurb on purpose."""
     if not qid:
         return {"birth_year": None, "death_year": None}
+    if qid in _birth_death_cache:
+        return _birth_death_cache[qid]
     query = f"""
     SELECT ?birth ?death WHERE {{
       OPTIONAL {{ wd:{qid} wdt:P569 ?birth . }}
@@ -134,14 +196,17 @@ def birth_death_years(qid: str) -> dict:
     try:
         rows = _sparql(query)
         if not rows:
-            return {"birth_year": None, "death_year": None}
-        row = rows[0]
-        by = int(row["birth"]["value"][:4]) if "birth" in row else None
-        dy = int(row["death"]["value"][:4]) if "death" in row else None
-        return {"birth_year": by, "death_year": dy}
+            result = {"birth_year": None, "death_year": None}
+        else:
+            row = rows[0]
+            by = int(row["birth"]["value"][:4]) if "birth" in row else None
+            dy = int(row["death"]["value"][:4]) if "death" in row else None
+            result = {"birth_year": by, "death_year": dy}
     except Exception as e:
         print(f"[wikidata_source] Birth/death year lookup failed for {qid}: {e}")
-        return {"birth_year": None, "death_year": None}
+        result = {"birth_year": None, "death_year": None}
+    _birth_death_cache[qid] = result
+    return result
 
 
 def image_claim(qid: str) -> str:
@@ -151,14 +216,18 @@ def image_claim(qid: str) -> str:
     it is the subject's own curated portrait rather than a search result."""
     if not qid:
         return None
+    if qid in _image_claim_cache:
+        return _image_claim_cache[qid]
     query = f"""
     SELECT ?image WHERE {{ wd:{qid} wdt:P18 ?image . }} LIMIT 1
     """
+    filename = None
     try:
         rows = _sparql(query)
         if rows:
             url = rows[0]["image"]["value"]
-            return requests.utils.unquote(url.rsplit("/", 1)[-1])
+            filename = requests.utils.unquote(url.rsplit("/", 1)[-1])
     except Exception as e:
         print(f"[wikidata_source] P18 image claim lookup failed for {qid}: {e}")
-    return None
+    _image_claim_cache[qid] = filename
+    return filename

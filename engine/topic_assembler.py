@@ -106,30 +106,41 @@ def build_batch_for_date(db, target_date: date = None) -> list:
     per_part = entries_per_part()
     jobs = []
 
+    # Cap raw candidates BEFORE the expensive per-candidate resolution (each
+    # one costs a Wikipedia QID lookup + a Wikidata SPARQL call) — slicing
+    # AFTER resolving, as this used to do, meant resolving the entire raw
+    # "on this day" list (hundreds of entries on a busy date) and is what
+    # caused the 429 storm on 2026-10-13. wikidata_source.py's own caching
+    # means re-resolving the same raw slice for the India-specific pass
+    # below costs zero extra network calls.
+    raw_births = raw["births"][:MAX_CANDIDATES_CONSIDERED]
+    raw_deaths = raw["deaths"][:MAX_CANDIDATES_CONSIDERED]
+    raw_events = raw["events"][:MAX_CANDIDATES_CONSIDERED]
+
     # 1. Born Today (Global) ────────────────────────────────────────────
-    born_global = _resolve_and_filter(db, raw["births"], "birth", date_str, "born_today")[:MAX_CANDIDATES_CONSIDERED]
+    born_global = _resolve_and_filter(db, raw_births, "birth", date_str, "born_today")
     born_global = notability.rank_candidates(born_global, "wikipedia_title")
     for i, part in enumerate(split_into_parts(born_global, per_part), start=1):
         jobs.append({"category": "born_today", "part_number": i if len(born_global) > per_part else None,
                      "candidates": part})
 
     # 2. Died Today (Global) ─────────────────────────────────────────────
-    died_global = _resolve_and_filter(db, raw["deaths"], "death", date_str, "died_today")[:MAX_CANDIDATES_CONSIDERED]
+    died_global = _resolve_and_filter(db, raw_deaths, "death", date_str, "died_today")
     died_global = notability.rank_candidates(died_global, "wikipedia_title")
     for i, part in enumerate(split_into_parts(died_global, per_part), start=1):
         jobs.append({"category": "died_today", "part_number": i if len(died_global) > per_part else None,
                      "candidates": part})
 
     # 3. Born/Died Today (India-specific) ────────────────────────────────
-    born_in = _resolve_and_filter(db, raw["births"], "birth", date_str, "born_died_india", india_only=True)
-    died_in = _resolve_and_filter(db, raw["deaths"], "death", date_str, "born_died_india", india_only=True)
-    india_people = notability.rank_candidates(born_in + died_in, "wikipedia_title")[:MAX_CANDIDATES_CONSIDERED]
+    born_in = _resolve_and_filter(db, raw_births, "birth", date_str, "born_died_india", india_only=True)
+    died_in = _resolve_and_filter(db, raw_deaths, "death", date_str, "born_died_india", india_only=True)
+    india_people = notability.rank_candidates(born_in + died_in, "wikipedia_title")
     for i, part in enumerate(split_into_parts(india_people, per_part), start=1):
         jobs.append({"category": "born_died_india", "part_number": i if len(india_people) > per_part else None,
                      "candidates": part})
 
     # 4. This Day in History — split World / India only if volume justifies it ──
-    events = _resolve_and_filter(db, raw["events"], "event", date_str, "history")[:MAX_CANDIDATES_CONSIDERED]
+    events = _resolve_and_filter(db, raw_events, "event", date_str, "history")
     events_india = [e for e in events if _is_india_related_event(e["text"])]
     events_world = [e for e in events if e not in events_india]
     events_india = notability.rank_candidates(events_india, "wikipedia_title")
