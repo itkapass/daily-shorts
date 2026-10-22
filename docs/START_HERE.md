@@ -99,6 +99,20 @@ Full detail: [docs/06_PAID_UPGRADES_LATER.md](06_PAID_UPGRADES_LATER.md) —
 cloned voice (free, self-hosted), ElevenLabs voice (paid), paid stock
 video / AI-generated B-roll for history events.
 
+## 10. Admin panel (optional, recommended) — **[web, ~10 min]**
+
+Full detail: [docs/09_ADMIN_PANEL.md](09_ADMIN_PANEL.md)
+
+A small web app to see how many days of videos are ready, watch one
+before it goes live, hold it back, or send it back for a redo with a
+note. Run it locally (`npm run dev`, nothing to sign up for) or deploy
+it to Vercel for a real link you can check from your phone — the doc
+covers both.
+
+- [ ] Run `supabase/migrations/001_admin_panel.sql` in the SQL Editor.
+- [ ] Create your one admin login (Supabase Dashboard → Authentication → Users).
+- [ ] `cd admin-panel && npm install && npm run dev` — or deploy to Vercel, see the doc.
+
 ## Something broke?
 
 [docs/08_TROUBLESHOOTING.md](08_TROUBLESHOOTING.md) covers the most

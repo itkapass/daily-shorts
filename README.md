@@ -19,9 +19,10 @@ there when you need it.
 
 ```
 engine/      The pipeline itself (research → script → voice → video → publish)
-supabase/    schema.sql — run this once in Supabase's SQL Editor
+supabase/    schema.sql + migrations/ — run these once in Supabase's SQL Editor
+admin-panel/ Optional web app: video queue, review, regenerate-with-note (docs/09)
 .github/     The 4 scheduled workflows that run this on autopilot
-docs/        START_HERE.md + 8 detailed per-topic setup guides
+docs/        START_HERE.md + 9 detailed per-topic setup guides
 tools/       selfcheck.py — run this to verify your setup before trusting it
 assets/      Fonts (bundled) and a staging folder for fallback videos
 ```

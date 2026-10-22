@@ -85,7 +85,7 @@ def _rules_hook_placeholder() -> str:
 
 
 def _build_user_prompt(candidates: list, observance_open: str, observance_close: str,
-                       job_id: str, target_runtime_seconds: float) -> str:
+                       job_id: str, target_runtime_seconds: float, admin_note: str = "") -> str:
     blocks = []
     for i, c in enumerate(candidates, 1):
         notes_block = research.prompt_block(c.get("research_notes") or [])
@@ -101,6 +101,14 @@ def _build_user_prompt(candidates: list, observance_open: str, observance_close:
         header += (f"Today is also a recognized observance. Make the VERY FIRST scene a 1-2 "
                    f"second greeting: \"{observance_open}\" fused naturally into the hook, and "
                    f"make the LAST scene's closing line incorporate: \"{observance_close}\"\n\n")
+    if admin_note:
+        # A human reviewer asked for this specific video to be regenerated
+        # with this guidance (set via the admin panel -- videos.admin_note,
+        # consumed once by orchestrator.py). Surfaced as a hard instruction,
+        # not a suggestion, since it's the one signal in this whole pipeline
+        # that came from an actual person who watched the last attempt.
+        header += (f"A human reviewer asked for this video to be redone with this specific "
+                   f"guidance -- follow it closely: \"{admin_note}\"\n\n")
 
     return (
         header +
@@ -146,8 +154,13 @@ def _extract_json(text: str) -> dict:
 
 
 def generate_storyboard(job: dict, job_id: str, observance_open: str = "",
-                        observance_close: str = "", db=None) -> dict:
-    """Returns {"title", "description", "hashtags", "scenes": [...], "provider": "gemini"|"groq"|...}."""
+                        observance_close: str = "", db=None, admin_note: str = "") -> dict:
+    """Returns {"title", "description", "hashtags", "scenes": [...], "provider": "gemini"|"groq"|...}.
+
+    `admin_note`: optional human-reviewer guidance from the admin panel
+    (videos.admin_note on a video marked status='regenerate_requested'),
+    threaded straight into the prompt -- see orchestrator.py for where
+    this gets read and cleared."""
     from engine import api_budget
     category, candidates = job["category"], job["candidates"]
     part_label = f", part {job['part_number']}" if job.get("part_number") else ""
@@ -155,7 +168,8 @@ def generate_storyboard(job: dict, job_id: str, observance_open: str = "",
 
     system_prompt = _build_system_prompt(category, part_label).replace(
         "HOOK_STYLE_PLACEHOLDER", _hook_for_job(job_id))
-    user_prompt = _build_user_prompt(candidates, observance_open, observance_close, job_id, runtime)
+    user_prompt = _build_user_prompt(candidates, observance_open, observance_close, job_id, runtime,
+                                     admin_note=admin_note)
     temperature = float(get("GEMINI_TEMPERATURE", "0.9"))
 
     provider = "gemini"

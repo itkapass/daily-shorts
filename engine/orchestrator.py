@@ -59,22 +59,47 @@ def _retry(fn, what: str, attempts: int = MAX_RETRIES_PER_STEP):
     raise RuntimeError(f"'{what}' failed after {attempts} attempts: {last_err}")
 
 
-def _render_job(db, job: dict, target_date, observance_open: str, observance_close: str) -> dict:
+def _render_job(db, job: dict, target_date, observance_open: str, observance_close: str,
+                admin_note: str = "") -> dict:
     category, part_number = job["category"], job.get("part_number")
     job_id = f"{category}_{part_number or 'x'}_{target_date.isoformat()}_{uuid.uuid4().hex[:6]}"
     output_dir = os.path.join(get("OUTPUT_DIR", "output"), job_id)
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n[orchestrator] === {job_id} ({len(job['candidates'])} candidates) ===")
+    if admin_note:
+        print(f"[orchestrator] {job_id}: regenerating per admin note: {admin_note!r}")
 
     storyboard = _retry(lambda: script_generator.generate_storyboard(
-        job, job_id, observance_open, observance_close, db=db), "script generation")
+        job, job_id, observance_open, observance_close, db=db, admin_note=admin_note), "script generation")
 
     voice = _retry(lambda: voice_engine.generate_voiceover(
         " ".join(s["voice_text"] for s in storyboard["scenes"]), job_id, output_dir), "voice synthesis")
     storyboard["_voice_engine"] = voice["engine"]
 
     scenes = voice_engine.get_scene_timestamps(voice["word_timestamps"], storyboard["scenes"])
+
+    # Prefer the QID we already resolved and verified ourselves (job["candidates"][i]["qid"],
+    # straight from wikidata_source) over trusting the model to have echoed
+    # "subject_qid" back correctly in its JSON (script_generator.py's RULES
+    # #6 asks it to, but a per-scene identifier silently dropped/nulled by
+    # the LLM is a real, observed failure mode -- it's what caused a real
+    # run on 2026-10-13 to produce zero photos across an entire video, text
+    # cards for even well-photographed public figures like a Premier League
+    # footballer and a world champion boxer, even though QID resolution
+    # itself had succeeded upstream). Per the prompt's RULES #1, scenes
+    # are always [hook, one per candidate in order, closing] -- when the
+    # model's scene count actually matches that shape, map by position
+    # instead of by the model's own copy of the identifier.
+    expected_scene_count = len(job["candidates"]) + 2
+    if len(scenes) == expected_scene_count:
+        for idx, candidate in enumerate(job["candidates"], start=1):
+            scenes[idx]["subject_qid"] = candidate.get("qid")
+    else:
+        print(f"[orchestrator] {job_id}: scene count ({len(scenes)}) didn't match "
+              f"hook+candidates+closing ({expected_scene_count}) -- using the model's own "
+              f"per-scene subject_qid instead of positional mapping.")
+
     for i, scene in enumerate(scenes, 1):
         duration_needed = scene["time_end"] - scene["time_start"]
         clip = None
@@ -89,6 +114,17 @@ def _render_job(db, job: dict, target_date, observance_open: str, observance_clo
         if not clip:
             clip = text_card.build_text_card_clip(scene["voice_text"], duration_needed, job_id, i, output_dir)
         scene["clip_path"] = clip["clip_path"] if clip else None
+        # "wikidata_qid" (a real QID-anchored photo) | "ai_abstract" | "text_card" |
+        # "none" (every option failed outright) -- persisted into the storyboard
+        # JSON (below) so the admin panel can show, per scene, whether a real
+        # photo was actually used without needing a separate DB column.
+        scene["visual_source"] = clip["source"] if clip else "none"
+
+    # Write the enriched scenes (timing + which visual each one actually got)
+    # back onto the storyboard before it's persisted, so videos.storyboard in
+    # the DB is the complete record of what was actually rendered, not just
+    # what the model originally proposed.
+    storyboard["scenes"] = scenes
 
     cards = subtitle_engine.build_caption_cards(voice["word_timestamps"])
     srt_path = os.path.join(output_dir, f"{job_id}.srt")
@@ -156,6 +192,18 @@ def run_generation_pipeline(target_date: date = None, ahead_days: int = 2) -> di
     observance_open = todays_obs[0]["open"] if todays_obs else ""
     observance_close = todays_obs[0]["close"] if todays_obs else ""
 
+    # A re-run of generation for a date that already has videos (e.g. the
+    # workflow manually re-triggered, or just this function called twice)
+    # must not silently create duplicate videos for the same category/part.
+    # This also doubles as how the admin panel's "regenerate with note"
+    # request actually gets fulfilled: a video marked status=
+    # 'regenerate_requested' (admin_note set) is picked up here, its note
+    # fed into script generation, and the old row replaced -- rather than
+    # needing a separate code path.
+    existing_rows = (db.table("videos").select("job_id,category,part_number,status,admin_note")
+                     .eq("scheduled_date", date_str).execute().data) or []
+    existing_by_key = {(r["category"], r["part_number"]): r for r in existing_rows}
+
     generated, failed, errors, scheduled_ids = [], [], [], []
     for i, job in enumerate(jobs):
         # Only the FIRST job of the day carries the observance wish segment
@@ -163,8 +211,27 @@ def run_generation_pipeline(target_date: date = None, ahead_days: int = 2) -> di
         # standalone video" — one video gets it, not every single one).
         open_line = observance_open if i == 0 else ""
         close_line = observance_close if i == 0 else ""
+
+        key = (job["category"], job.get("part_number"))
+        existing = existing_by_key.get(key)
+        admin_note = ""
+        if existing:
+            if existing["status"] == "regenerate_requested":
+                admin_note = existing.get("admin_note") or ""
+            elif existing["status"] in ("approved", "published", "held"):
+                print(f"[orchestrator] {key} already generated for {date_str} "
+                      f"(job_id={existing['job_id']}, status={existing['status']}) — skipping.")
+                continue
+            # any other status (rendering/failed left over from a crashed
+            # run) falls through and gets regenerated below, same as before
+            # this check existed.
+
         try:
-            result = _render_job(db, job, target_date, open_line, close_line)
+            result = _render_job(db, job, target_date, open_line, close_line, admin_note=admin_note)
+            if existing and existing["status"] == "regenerate_requested":
+                db.table("videos").delete().eq("job_id", existing["job_id"]).execute()
+                print(f"[orchestrator] Replaced {existing['job_id']} with {result['job_id']} "
+                      f"per admin regeneration request.")
             generated.append(result)
             scheduled_ids.append((result["job_id"], result["category"], result["part_number"]))
         except Exception as e:
